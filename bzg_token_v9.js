@@ -1,16 +1,15 @@
-// bzg_token_v9.js —— 煲珠公 M-Access-Token 抓取 + 取回（单域名方案）
-// 设计要点：
-//   1) 不再使用任何虚构域名。抓取与取回都走真实域名 po.bzgteam.cn。
-//   2) 取回专用路径 /bzg_token_retrieve 在真实服务器上并不存在，
-//      但 QX 会在请求阶段 MITM 拦截并直接短路返回已存 token，请求绝不会到达服务器。
-//   3) 同一份脚本按 URL 分流：
-//        - 含 /bzg_token_retrieve  → 取回模式（短路返回 token 或 404 NO_TOKEN）
-//        - 其它 po.bzgteam.cn 请求 → 抓取模式（读 m-access-token 头并存盘，原样放行）
-//   4) 全程只用真实域名，避免虚构域名 DNS 失败导致 script-request-header 不触发。
+// bzg_token_v9.js —— 煲珠公 M-Access-Token 抓取 + 取回（单域名 + 自诊断）
+// 抓包已确认：M-Access-Token 在请求头里（大写），方向正确。
+// 本版增加诊断：取回时若无 token，返回"脚本是否见过请求 / 是否看到 token 头"，便于定位。
+//
+// 部署（二选一，推荐 A，最少改动且你已验证 raw 可下载）：
+//   A) 把本文件上传到 GitHub 仓库，文件名 bzg_token_v9.js（新文件，避开缓存），
+//      再用 bzg_qx_v9.conf（里面引用该 raw URL）。
+//   B) 通过 QX「引用资源 → 脚本」把本文件加入资源库，conf 用裸文件名 bzg_token_v9.js。
 
 var KEY = 'bzg_token';
 var RETRIEVE_PATH = '/bzg_token_retrieve';
-var CANDIDATE_HEADERS = ['m-access-token', 'm_access_token', 'access-token', 'authorization'];
+var CANDIDATE_HEADERS = ['m-access-token', 'm_access_token', 'access-token', 'authorization', 'x-access-token'];
 
 function getHeader(headers, names) {
   if (!headers) return '';
@@ -30,10 +29,17 @@ function notify(title, sub) {
   try {
     var now = Date.now();
     var last = parseInt($persistentStore.read('bzg_last_notify') || '0', 10) || 0;
-    if (now - last > 5000) {            // 5 秒节流，避免开小程序时刷屏
+    if (now - last > 5000) {
       $notification.post(title, sub || '', '');
       $persistentStore.write(String(now), 'bzg_last_notify');
     }
+  } catch (e) {}
+}
+
+function setSeen(host, found) {
+  try {
+    // 格式：时间戳|host|是否看到token头(0/1)
+    $persistentStore.write(Date.now() + '|' + (host || '') + '|' + (found ? '1' : '0'), 'bzg_last_seen');
   } catch (e) {}
 }
 
@@ -42,37 +48,31 @@ try {
   var isRetrieve = url.indexOf(RETRIEVE_PATH) >= 0;
 
   if (isRetrieve) {
-    // —— 取回模式：请求阶段直接短路，绝不连真实上游 ——
-    var v = ($persistentStore.read(KEY) || '').toString();
+    var v = ($persistentStore.read(KEY) || '').toString().trim();
     if (v) {
-      $done({
-        response: {
-          statusCode: 200,
-          headers: { 'Content-Type': 'text/plain; charset=utf-8' },
-          body: v
-        }
-      });
+      $done({ response: { statusCode: 200, headers: { 'Content-Type': 'text/plain; charset=utf-8' }, body: v } });
     } else {
-      $done({
-        response: {
-          statusCode: 404,
-          headers: { 'Content-Type': 'text/plain; charset=utf-8' },
-          body: 'NO_TOKEN'
-        }
-      });
+      // 无 token：返回诊断，帮助定位"到底是哪一步断了"
+      var seen = ($persistentStore.read('bzg_last_seen') || 'never').toString();
+      var diag = 'NO_TOKEN|seen=' + seen + '|v=9';
+      $done({ response: { statusCode: 200, headers: { 'Content-Type': 'text/plain; charset=utf-8' }, body: diag } });
     }
     return;
   }
 
-  // —— 抓取模式：从请求头取 token，存盘后原样放行 ——
+  // 抓取模式：记录"脚本是否见过小程序请求"，再尝试取 token
+  var host = '';
+  try { host = (url || '').replace(/^https?:\/\//, '').split('/')[0]; } catch (e) {}
   var headers = ($request && $request.headers) || {};
   var t = getHeader(headers, CANDIDATE_HEADERS);
+  var found = !!t;
+  setSeen(host, found);
   if (t) {
     $persistentStore.write(t, KEY);
     $persistentStore.write(String(Date.now()), 'bzg_token_captured_at');
     notify('BZG·抓取成功', 'token长度=' + t.length);
   }
-  $done({});   // 放行，不短路
+  $done({});
 } catch (e) {
   notify('BZG·脚本出错', String(e));
   $done({});
