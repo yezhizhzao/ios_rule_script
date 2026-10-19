@@ -1,6 +1,34 @@
-// bzg_test_notify.js (响应阶段版) —— 同时负责：抓取 M-Access-Token + 弹通知
-// 必须在 script-response-header 阶段运行；
-// 绝不要在请求阶段(script-request-header)弹通知——那会卡住 $done 导致请求悬空、网络异常。
+// bzg_test_notify.js (QX/Surge 兼容版) —— 响应阶段抓 token + 弹通知
+// 修复：Quantumult X 用 $prefs/$notify，Surge 用 $persistentStore/$notification.post。
+// 本脚本自动适配两种环境。
+
+function notify(title, subtitle, message) {
+  if (typeof $notify === 'function') {
+    $notify(title, subtitle, message);
+  } else if (typeof $notification !== 'undefined' && typeof $notification.post === 'function') {
+    $notification.post(title, subtitle, message);
+  }
+}
+
+function storeRead(key) {
+  if (typeof $prefs !== 'undefined' && typeof $prefs.valueForKey === 'function') {
+    return $prefs.valueForKey(key);
+  }
+  if (typeof $persistentStore !== 'undefined' && typeof $persistentStore.read === 'function') {
+    return $persistentStore.read(key);
+  }
+  return null;
+}
+
+function storeWrite(key, value) {
+  if (typeof $prefs !== 'undefined' && typeof $prefs.setValueForKey === 'function') {
+    return $prefs.setValueForKey(value, key);
+  }
+  if (typeof $persistentStore !== 'undefined' && typeof $persistentStore.write === 'function') {
+    return $persistentStore.write(value, key);
+  }
+}
+
 var KEY = 'bzg_token';
 var DIAG = 'bzg_diag';
 var CANDIDATE = ['m-access-token', 'm_access_token', 'access-token', 'authorization', 'x-access-token'];
@@ -28,26 +56,26 @@ try {
   var reqHeaders = ($request && $request.headers) || {};
   var t = headerValue(reqHeaders, CANDIDATE);
   var diag = '时间=' + new Date().toISOString() + ' | host=' + hostOf(url) + ' | 有token键=' + (t ? 1 : 0) + ' | len=' + (t ? t.length : 0);
-  $persistentStore.write(diag, DIAG);
-  if (t) { $persistentStore.write(t, KEY); }
+  storeWrite(DIAG, diag);
+  if (t) { storeWrite(KEY, t); }
 
   // 首次运行弹一条，证明响应阶段通知通道是通的（不会刷屏）
-  if (!$persistentStore.read('bzg_test_started')) {
-    $persistentStore.write('1', 'bzg_test_started');
-    $notification.post('BZG·TEST 脚本已执行', '响应阶段通知通道正常', '进入门店后会弹出抓到的 token');
+  if (!storeRead('bzg_test_started')) {
+    storeWrite('bzg_test_started', '1');
+    notify('BZG·TEST 脚本已执行', '响应阶段通知通道正常', '进入门店后会弹出抓到的 token');
   }
 
   // 抓到“新”的 token 才弹（避免重复刷屏）
-  if (t && t !== $persistentStore.read('bzg_last_token')) {
-    $persistentStore.write(t, 'bzg_last_token');
-    $notification.post('BZG·抓到 M-Access-Token', 'len=' + t.length, t);
+  if (t && t !== storeRead('bzg_last_token')) {
+    storeWrite('bzg_last_token', t);
+    notify('BZG·抓到 M-Access-Token', 'len=' + t.length, t);
   }
 
   $done({});
 } catch (e) {
   try {
-    $persistentStore.write('test_err=' + String(e), DIAG);
-    $notification.post('BZG·TEST出错', String(e), '');
+    storeWrite(DIAG, 'test_err=' + String(e));
+    notify('BZG·TEST出错', String(e), '');
   } catch (_) {}
   $done({});
 }
