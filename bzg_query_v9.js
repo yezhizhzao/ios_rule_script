@@ -1,8 +1,6 @@
 // 煲珠公·东莞门店查商品（Scriptable 版 v9）
-// 改动：取回端点从虚构域名改为真实后端 po.bzgteam.cn/bzg_token_retrieve
-//       （由 QX 在请求阶段短路返回 token，无需虚构域名）。
-//       取回无 token 时显示 QX 自诊断，便于定位断点。
-// 用法：Scriptable → 新建脚本 → 粘贴本文件 → 运行。
+// 改动：取回端点 po.bzgteam.cn/bzg_token_retrieve；无 token 时显示 QX 自诊断。
+//       取回异常时直接弹出原始返回/错误信息，避免直接掉进手动粘贴。
 
 const TOKEN_URL = "https://po.bzgteam.cn/bzg_token_retrieve";
 const API_HOST = "po.bzgteam.cn";
@@ -68,35 +66,83 @@ function looksLikeToken(t){
   return typeof t==="string" && t.length>50 && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(t);
 }
 
+function parseSeen(seen){
+  if (seen === 'never' || !seen) return {kind:'never'};
+  let p = String(seen).split('|');
+  if (p.length >= 3){
+    return {
+      kind:'seen',
+      ts: p[0],
+      host: p[1]||'',
+      found: p[2]==='1',
+      hasKey: p.length>=4 ? p[3]==='1' : null
+    };
+  }
+  return {kind:'unknown', raw: seen};
+}
+
+async function showErrorThenManual(title, message){
+  let a = new Alert();
+  a.title = title;
+  a.message = message;
+  a.addAction("手动粘贴");
+  a.addCancelAction("取消");
+  if (await a.present() === -1) return null;
+  return await manualToken();
+}
+
 async function getToken(){
-  // 1) 本地记忆（Keychain，24h 内复用，免 QX）
+  // 1) 本地记忆
   try { let t = Keychain.read("bzg_token"); if (looksLikeToken(t)) return {token:t, src:"本地记忆"}; } catch(e){}
 
-  // 2) QX 自动取回（真实域名，QX 请求阶段短路返回）
+  // 2) QX 自动取回
+  let raw = '';
+  let err = null;
   try {
-    let req = new Request(TOKEN_URL); req.timeoutInterval = 8;
-    let raw = (await req.loadString()).trim();
+    let url = TOKEN_URL + "?ts=" + Date.now();
+    let req = new Request(url);
+    req.timeoutInterval = 8;
+    req.headers = { "Cache-Control":"no-cache", "Pragma":"no-cache" };
+    raw = (await req.loadString()).trim();
+
     if (raw.indexOf("NO_TOKEN") === 0) {
-      // QX 在线且拦截成功（返回了诊断串），但还没抓到 token
-      let diag = raw.replace(/^NO_TOKEN\|?/, '').replace(/\|/g, '\n');
+      let diag = raw.replace(/^NO_TOKEN\|?/, '');
+      let info = parseSeen((diag.match(/seen=([^|]+)/)||[])[1]);
+      let explain = '';
+      if (info.kind === 'never'){
+        explain = '脚本完全没见过 po.bzgteam.cn 请求。\n可能：规则未加载 / 小程序没发请求 / QX 未运行。';
+      } else if (info.kind === 'seen'){
+        let base = '最近脚本运行时间=' + new Date(parseInt(info.ts)||0).toLocaleString() + '\nhost=' + info.host + '\n';
+        if (info.found){
+          explain = base + '已抓到 token，但仍返回 NO_TOKEN（取回分支异常，请检查 MitM/规则）';
+        } else if (info.hasKey === false){
+          explain = base + '请求里**没有** m-access-token 键。\n你访问的接口不带 token，请换别的门店入口再试。';
+        } else if (info.hasKey === true){
+          explain = base + '有 m-access-token 键，但值为空/不是预期格式。';
+        } else {
+          explain = base + '未抓到 token。请换别的门店入口再试。';
+        }
+      }
       let a = new Alert();
       a.title = "QX 已就绪，但还没抓到 Token";
-      a.message = "诊断：" + diag + "\n\n解读：\n• seen=never → QX 脚本没跑 / 规则没加载 / 小程序没发请求\n• seen=时间戳|po.bzgteam.cn|0 → 脚本见到请求但没看到 token 头\n• seen=时间戳|po.bzgteam.cn|1 → 已抓到却仍返回 NO_TOKEN（异常）\n\n请先在微信打开「煲珠公」小程序并随便进一家店，再重跑本脚本。\n\n是否改为手动粘贴一次？";
+      a.message = "诊断：" + diag.replace(/\|/g, '\n') + "\n\n解读：\n" + explain + "\n\n是否改为手动粘贴一次？";
       a.addAction("手动粘贴");
       a.addCancelAction("稍后再试");
       if (await a.present() === -1) return null;
       return await manualToken();
     }
+
     if (looksLikeToken(raw)) {
       try{ Keychain.write("bzg_token", raw); }catch(e){}
       return {token:raw, src:"QX自动"};
     }
-  } catch(e){
-    // 多半是 QX 未运行 / 未开启 MitM：降级到手动
-  }
 
-  // 3) 手动粘贴（一次性，之后写入 Keychain 复用）
-  return await manualToken();
+    // 走到这里说明 QX 返回了既不是 NO_TOKEN 也不是 token 的内容（大概率穿透到真实服务器 404）
+    return await showErrorThenManual("QX 返回异常", "QX 没有短路返回 token。\n\n原始返回（前 300 字）：\n" + raw.slice(0,300) + "\n\n这通常意味着：\n1) QX 没拦截这条取回请求；\n2) 或 QX 脚本在取回分支出错/被缓存。\n\n请检查：QX 是否开启、MitM 是否包含 po.bzgteam.cn、conf 是否已加载。");
+  } catch(e){
+    err = String(e);
+    return await showErrorThenManual("取回请求失败", "请求 QX 取回端点时报错：\n" + err + "\n\n常见原因：QX 未运行 / Scriptable 不信任 QX 证书 / 网络超时。");
+  }
 }
 
 async function manualToken(){
